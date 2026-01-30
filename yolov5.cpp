@@ -157,7 +157,7 @@ int Yolov5::post_process(const cv::Mat &image,  std::vector<Detection>& detectio
 	{
 		float* ptr = output_h + i * output_numprob;
 		float obj_score = ptr[4];
-		if (obj_score > confidence_threshold)
+		if (obj_score < confidence_threshold)
 			continue;
 
 		float* classes_scores = 5 + ptr;
