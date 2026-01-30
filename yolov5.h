@@ -14,13 +14,20 @@
 #include "preprocess.h"
 #include "postprocess.h"
 
-//#define USE_CUDA
+#define CUDA_PREPROCESS
 
-#ifdef USE_CUDA
+#ifdef CUDA_PREPROCESS
     #include "preprocess.cuh"
-    #include "decode.cuh"
+    #include "postprocess.cuh"
 #endif
 
+
+struct Detection
+{
+	int id;             //class id
+	float score;   		//score
+	cv::Rect bbox;      //bounding box
+};
 
 class Yolov5
 {
@@ -30,10 +37,13 @@ public:
 
     int load_model(const std::string& model_path);                        // 加载模型
     int infer(const cv::Mat &image, std::vector<Detection> &detections); // 推理运行模型
+    int infer_nvcodec(uint8_t* image, std::vector<Detection> &detections); // 推理运行模型
+    void draw_detections(int id, cv::Mat& image, std::vector<Detection>& detections); // 绘制检测框
+    void draw_detections(int id, uint8_t* image, std::vector<Detection>& detections); // 绘制检测框
 
 private:
     int pre_process(const cv::Mat &image);   // 图像预处理
-    int post_process(const cv::Mat &image, std::vector<Detection>& detections); // 后处理
+    int post_process(const cv::Size& image_size, std::vector<Detection>& detections); // 后处理
 
     const cv::Size input_size = cv::Size(640, 640);
     const int input_numel = 1 * 3 * input_size.width * input_size.height;
@@ -55,8 +65,7 @@ private:
 	float* output_d = nullptr;
     float* bindings[2]; 
 
-#ifdef USE_CUDA
-	uint8_t* input_host;
+	uint8_t* input_device;
 	float* d2s_host;
    	float* d2s_device; 
     float* s2d_host;
@@ -66,7 +75,6 @@ private:
     const int max_box = 1024;
    	const int nubox_element = 7; 
     const int max_input_size = sizeof(float) * 3 * 1024 * 1024;
-#endif
 };
 
 #endif // YOLOV5_H

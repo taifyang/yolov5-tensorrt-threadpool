@@ -86,9 +86,14 @@ __global__ void warpaffine_kernel( uint8_t* src, int src_line_size, int src_widt
     *pdst_c0 = c0;
     *pdst_c1 = c1;
     *pdst_c2 = c2;
+
+    // float* pdst = dst + (dy * dst_width + dx) * 3;
+    // pdst[0] = c0;  // R 通道
+    // pdst[1] = c1;  // G 通道
+    // pdst[2] = c2;  // B 通道
 }
 
-void preprocess_kernel_img(uint8_t* src, int src_width, int src_height, float* dst, int dst_width, int dst_height, float* affine_matrix, float* affine_matrix_inverse, cudaStream_t stream)
+void preprocess_cuda(uint8_t* src, int src_width, int src_height, float* dst, int dst_width, int dst_height, float* affine_matrix, float* affine_matrix_inverse)
 {
     AffineMatrix s2d,d2s;
     float scale = std::min(dst_height / (float)src_height, dst_width / (float)src_width);
@@ -104,12 +109,12 @@ void preprocess_kernel_img(uint8_t* src, int src_width, int src_height, float* d
     cv::Mat m2x3_d2s(2, 3, CV_32F, d2s.value);
     cv::invertAffineTransform(m2x3_s2d, m2x3_d2s);
 
-	memcpy(affine_matrix, m2x3_d2s.data, 6 * sizeof(affine_matrix));
-    memcpy(affine_matrix_inverse, m2x3_s2d.data, 6 * sizeof(affine_matrix_inverse));
+	memcpy(affine_matrix, m2x3_d2s.data, 6 * sizeof(float));
+    memcpy(affine_matrix_inverse, m2x3_s2d.data, 6 * sizeof(float));
     memcpy(d2s.value, m2x3_d2s.ptr<float>(0), sizeof(d2s.value));
 
     int jobs = dst_height * dst_width;
     int threads = 1024;
     int blocks = ceil(jobs / (float)threads);
-    warpaffine_kernel<<<blocks, threads, 0, stream>>>(src, src_width*3, src_width, src_height, dst, dst_width, dst_height, 114, d2s, jobs);
+    warpaffine_kernel<<<blocks, threads>>>(src, src_width*3, src_width, src_height, dst, dst_width, dst_height, 114, d2s, jobs);
 }

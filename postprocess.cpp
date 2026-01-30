@@ -1,4 +1,5 @@
 #include "postprocess.h"
+#include "global_var.h"
 
 
 void nms(std::vector<cv::Rect>& boxes, std::vector<float>& scores, float score_threshold, float nms_threshold, std::vector<int>& indices)
@@ -56,7 +57,6 @@ void nms(std::vector<cv::Rect>& boxes, std::vector<float>& scores, float score_t
 	}
 }
 
-
 void scale_boxes(cv::Rect& box, cv::Size input_size, cv::Size output_size)
 {
 	float gain = std::min(input_size.width * 1.0 / output_size.width, input_size.height * 1.0 / output_size.height);
@@ -68,18 +68,4 @@ void scale_boxes(cv::Rect& box, cv::Size input_size, cv::Size output_size)
 	box.y /= gain;
 	box.width /= gain;
 	box.height /= gain;
-}
-
-void draw_detections(cv::Mat& image, std::vector<Detection>& detections)
-{
-    for (int i = 0; i < detections.size(); i++)
-    {
-        Detection detection = detections[i];
-        int idx = detection.id;
-        float score = detection.score;
-        cv::Rect bbox = detection.bbox;
-        std::string label = "class" + std::to_string(idx) + ":" + cv::format("%.2f", score);
-        cv::rectangle(image, bbox, cv::Scalar(0, 255, 0), 2);
-        cv::putText(image, label, cv::Point(bbox.x, bbox.y), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
-    }
 }

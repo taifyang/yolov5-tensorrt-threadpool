@@ -1,8 +1,12 @@
 
 #include "yolov5_thread_pool.h"
 
+
 // 构造函数
-Yolov5ThreadPool::Yolov5ThreadPool() { stop = false; }
+Yolov5ThreadPool::Yolov5ThreadPool() 
+{ 
+    stop = false;
+}
 
 // 析构函数
 Yolov5ThreadPool::~Yolov5ThreadPool()
@@ -13,9 +17,7 @@ Yolov5ThreadPool::~Yolov5ThreadPool()
     for (auto &thread : threads)
     {
         if (thread.joinable())
-        {
             thread.join();
-        }
     }
 }
 
@@ -35,16 +37,21 @@ int Yolov5ThreadPool::setUp(const std::string &model_path, int num_threads)
     {
         threads.emplace_back(&Yolov5ThreadPool::worker, this, i);
     }
+
     return 0;
 }
-
 
 // 线程函数。参数：线程id
 void Yolov5ThreadPool::worker(int id)
 {
     while (!stop)
     {
+#ifndef USE_NVCODEC
         std::pair<int, cv::Mat> task;
+#else
+        std::pair<int, uint8_t*> task;
+#endif
+
         std::shared_ptr<Yolov5> instance = yolov5_instances[id]; // 获取模型实例
         {
             // 获取任务
@@ -56,15 +63,20 @@ void Yolov5ThreadPool::worker(int id)
             task = tasks.front();
             tasks.pop();
         }
-        // 运行模型
+
         std::vector<Detection> detections;
+        // 运行模型
+#ifndef USE_NVCODEC
         instance->infer(task.second, detections);
+#else
+        instance->infer_nvcodec(task.second, detections);
+#endif
 
         {
             // 保存结果
             std::lock_guard<std::mutex> lock(mtx2);
             results.insert({task.first, detections});
-            draw_detections(task.second, detections);
+            //instance->draw_detections(task.first, task.second, detections);
             img_results.insert({task.first, task.second});
             cv_result.notify_one();
         }
@@ -73,22 +85,41 @@ void Yolov5ThreadPool::worker(int id)
 
 
 // 提交任务，参数：图片，id（帧号）
-int Yolov5ThreadPool::submitTask(const cv::Mat &img, int id)
-{
-    // 如果任务队列中的任务数量大于10，等待，避免内存占用过多
-    while (tasks.size() > 1000)
+#ifndef USE_NVCODEC
+    int Yolov5ThreadPool::submitImgTask(const cv::Mat& img, int id)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+        // 如果任务队列中的任务数量大于10，等待，避免内存占用过多
+        while (tasks.size() > 1000)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
 
-    {
-        // 保存任务
-        std::lock_guard<std::mutex> lock(mtx1);
-        tasks.push({id, img});
+        {
+            // 保存任务
+            std::lock_guard<std::mutex> lock(mtx1);
+            tasks.push({id, img});
+        }
+        cv_task.notify_one();
+        return 0;
     }
-    cv_task.notify_one();
-    return 0;
-}
+#else
+    int Yolov5ThreadPool::submitImgTask(uint8_t* img, int id)
+    {
+        // 如果任务队列中的任务数量大于10，等待，避免内存占用过多
+        while (tasks.size() > 10)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        {
+            // 保存任务
+            std::lock_guard<std::mutex> lock(mtx1);
+            tasks.push({id, img});
+        }
+        cv_task.notify_one();
+        return 0;
+    }
+#endif
 
 // 获取结果，参数：检测框，id（帧号）
 int Yolov5ThreadPool::getTargetResult(std::vector<Detection> &objects, int id)
@@ -106,6 +137,8 @@ int Yolov5ThreadPool::getTargetResult(std::vector<Detection> &objects, int id)
 }
 
 // 获取结果（图片），参数：图片，id（帧号）
+
+#ifndef USE_NVCODEC
 int Yolov5ThreadPool::getTargetImgResult(cv::Mat &img, int id)
 {
     int loop_cnt = 0;
@@ -118,7 +151,7 @@ int Yolov5ThreadPool::getTargetImgResult(cv::Mat &img, int id)
         if (loop_cnt > 1000)
         {
             std::cerr << "getTargetImgResult timeout" << std::endl;
-            return 0;
+            return -1;
         }
     }
     std::lock_guard<std::mutex> lock(mtx2);
@@ -128,6 +161,31 @@ int Yolov5ThreadPool::getTargetImgResult(cv::Mat &img, int id)
 
     return 0;
 }
+#else
+int Yolov5ThreadPool::getTargetImgResult(uint8_t* img, int id)
+{
+    int loop_cnt = 0;
+    // 如果没有结果，等待
+    while (img_results.find(id) == img_results.end())
+    {
+        // 等待 
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        loop_cnt++;
+        if (loop_cnt > 1000)
+        {
+            std::cerr << "getTargetImgResult timeout" << std::endl;
+            return -1;
+        }
+    }
+    std::lock_guard<std::mutex> lock(mtx2);
+    img = img_results[id];
+
+    // remove from map
+    img_results.erase(id);
+
+    return 0;
+}
+#endif
 
 void Yolov5ThreadPool::stopAll()
 {

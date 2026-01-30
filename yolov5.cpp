@@ -1,5 +1,9 @@
 #include "yolov5.h"
 #include "logger.h"
+#include "global_var.h"
+
+int global_w = 0, global_h = 0, global_y_stride = 0;
+size_t global_nv12_size = 0, global_bgr_size = 0;
 
 
 Yolov5::Yolov5()
@@ -15,8 +19,8 @@ Yolov5::Yolov5()
 	bindings[0] = input_d;
 	bindings[1] = output_d;
 
-#ifdef USE_CUDA
-	cudaMallocHost(&input_host, max_input_size);
+#ifdef CUDA_PREPROCESS
+	cudaMalloc(&input_device, max_input_size);
 	cudaMallocHost(&d2s_host, sizeof(float) * 6);
 	cudaMalloc(&d2s_device, sizeof(float) * 6);
 	cudaMallocHost(&s2d_host, sizeof(float) * 6);
@@ -29,18 +33,21 @@ Yolov5::Yolov5()
 Yolov5::~Yolov5()
 {
 	cudaStreamDestroy(stream);
+	cudaFree(input_device);
 	cudaFree(input_d);
     cudaFree(output_d);
 	cudaFreeHost(input_h);
     cudaFreeHost(output_h);
 }
 
-
 int Yolov5::load_model(const std::string& model_path)
 {
     std::ifstream in(model_path, std::ios::binary);
     if (!in.is_open()) 
+	{
+		std::cerr << "Failed to open engine file: " << model_path << std::endl;
 		return -1;
+	}
 
     in.seekg(0, std::ios::end);
     size_t size = in.tellg();
@@ -51,11 +58,17 @@ int Yolov5::load_model(const std::string& model_path)
 
     engine = runtime->deserializeCudaEngine(engine_data.data(), engine_data.size());
 	if(engine == nullptr) 
+	{
+		std::cerr << "Deserialize engine failed" << std::endl;
 		return -1;
+	}
 
     execution_context = engine->createExecutionContext();
 	if(execution_context == nullptr)
+	{
+		std::cerr << "Create execution context failed" << std::endl;
 		return -1;
+	}
 
     cudaStreamCreate(&stream);
     return 0;
@@ -64,15 +77,15 @@ int Yolov5::load_model(const std::string& model_path)
 
 int Yolov5::pre_process(const cv::Mat &image)
 {
-#ifdef USE_CUDA
-	cudaMemcpyAsync(input_host, image.data, sizeof(uint8_t) * 3 * image.cols * image.rows, cudaMemcpyHostToDevice, stream);
-	preprocess_kernel_img(input_host, image.cols, image.rows, input_d, input_size.width, input_size.height, d2s_host, s2d_host, stream);
-	cudaMemcpyAsync(d2s_device, d2s_host, sizeof(float) * 6, cudaMemcpyHostToDevice, stream);
-	cudaMemcpyAsync(s2d_device, s2d_host, sizeof(float) * 6, cudaMemcpyHostToDevice, stream);
+#ifdef CUDA_PREPROCESS
+	cudaMemcpy(input_device, image.data, sizeof(uint8_t) * 3 * image.cols * image.rows, cudaMemcpyHostToDevice);
+	preprocess_cuda(input_device, image.cols, image.rows, input_d, input_size.width, input_size.height, d2s_host, s2d_host);
+	cudaMemcpy(d2s_device, d2s_host, sizeof(float) * 6, cudaMemcpyHostToDevice);
+	cudaMemcpy(s2d_device, s2d_host, sizeof(float) * 6, cudaMemcpyHostToDevice);
+
 #else
 	cv::Mat letterbox;
 	LetterBox(image, letterbox, input_size);
-	//cv::resize(image, letterbox, input_size);
 	letterbox.convertTo(letterbox, CV_32FC3, 1.0f / 255.0f);
 
 	int image_area = letterbox.cols * letterbox.rows;
@@ -89,9 +102,9 @@ int Yolov5::pre_process(const cv::Mat &image)
 
 	cudaMemcpyAsync(input_d, input_h, sizeof(float) * input_numel, cudaMemcpyHostToDevice, stream);
 #endif
+
     return 0;
 }
-
 
 int Yolov5::infer(const cv::Mat& image, std::vector<Detection>& detections)
 {
@@ -104,23 +117,43 @@ int Yolov5::infer(const cv::Mat& image, std::vector<Detection>& detections)
 	    return -1;
 	}
 
-#ifndef USE_CUDA
+#ifndef CUDA_POSTPROCESS
 	cudaMemcpyAsync(output_h, output_d, sizeof(float) * output_numel, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 #endif
 
-    post_process(image, detections);
+    post_process(image.size(), detections);
     return 0;
 }
 
+#ifdef USE_NVCODEC
+int Yolov5::infer_nvcodec(uint8_t* image, std::vector<Detection> &detections)
+{
+	preprocess_cuda(image, global_w, global_h, input_d, input_size.width, input_size.height, d2s_host, s2d_host);
+	// cudaMemcpy(d2s_device, d2s_host, sizeof(float) * 6, cudaMemcpyHostToDevice);
+	// cudaMemcpy(s2d_device, s2d_host, sizeof(float) * 6, cudaMemcpyHostToDevice);
 
-int Yolov5::post_process(const cv::Mat &image,  std::vector<Detection>& detections)
+	bool success = execution_context->executeV2((void**)bindings);
+	if(!success)
+	{
+		std::cerr << "Failed to run inference" << std::endl;
+		return -1;
+	}
+	cudaMemcpyAsync(output_h, output_d, sizeof(float) * output_numel, cudaMemcpyDeviceToHost, stream);
+	cudaStreamSynchronize(stream);
+
+	post_process(cv::Size(global_w, global_h), detections);
+	return 0;
+}
+#endif
+
+int Yolov5::post_process(const cv::Size& image_size,  std::vector<Detection>& detections)
 {
     std::vector<cv::Rect> boxes;
 	std::vector<float> scores;
 	std::vector<int> class_ids;
 
-#ifdef USE_CUDA
+#ifdef CUDA_POSTPROCESS
 	cudaMemset(output_box_device, 0, sizeof(float) * (nubox_element * max_box + 1));	
 	decode_kernel_invoker(output_d, output_numbox, class_num, score_threshold, d2s_device, output_box_device, max_box, nubox_element, stream);
 	nms_kernel_invoker(output_box_device, nms_threshold, max_box, nubox_element, stream);
@@ -151,8 +184,6 @@ int Yolov5::post_process(const cv::Mat &image,  std::vector<Detection>& detectio
 	}
 
 #else
-	// float x_ratio = float(image.cols) / input_size.width;
-	// float y_ratio = float(image.rows) / input_size.height;
 	for (int i = 0; i < output_numbox; ++i)
 	{
 		float* ptr = output_h + i * output_numprob;
@@ -176,15 +207,16 @@ int Yolov5::post_process(const cv::Mat &image,  std::vector<Detection>& detectio
 		int height = int(h);
 
 		cv::Rect box = cv::Rect(left, top, width, height);
-		scale_boxes(box, input_size, image.size());
+		scale_boxes(box, input_size, image_size);
 		boxes.push_back(box);
 		scores.push_back(score);
 		class_ids.push_back(class_id);
 	}
 
 	std::vector<int> indices;
-	nms(boxes, scores, score_threshold, nms_threshold, indices);
-	
+	cv::dnn::NMSBoxes(boxes, scores, score_threshold, nms_threshold, indices);
+	//nms(boxes, scores, score_threshold, nms_threshold, indices);
+
 	detections.clear();
 	detections.resize(indices.size());
 	for (int i = 0; i < indices.size(); ++i)
@@ -197,4 +229,39 @@ int Yolov5::post_process(const cv::Mat &image,  std::vector<Detection>& detectio
 #endif
 
     return 0;
+}
+
+void Yolov5::draw_detections(int id, cv::Mat& image, std::vector<Detection>& detections)
+{
+    for (int i = 0; i < detections.size(); i++)
+    {
+        Detection detection = detections[i];
+        int idx = detection.id;
+        float score = detection.score;
+        cv::Rect bbox = detection.bbox;
+        std::string label = "class" + std::to_string(idx) + ":" + cv::format("%.2f", score);
+        cv::rectangle(image, bbox, cv::Scalar(0, 255, 0), 2);
+        cv::putText(image, label, cv::Point(bbox.x, bbox.y), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+    }
+
+	cv::imwrite("output/" + std::to_string(id) + ".jpg", image);
+}
+
+void Yolov5::draw_detections(int id, uint8_t* image, std::vector<Detection>& detections)
+{
+    cv::Mat image_mat(global_h, global_w, CV_8UC3);
+	cudaMemcpy(image_mat.data, image, sizeof(uint8_t) * 3 * global_w * global_h, cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < detections.size(); i++)
+    {
+        Detection detection = detections[i];
+        int idx = detection.id;
+        float score = detection.score;
+        cv::Rect bbox = detection.bbox;
+        std::string label = "class" + std::to_string(idx) + ":" + cv::format("%.2f", score);
+        cv::rectangle(image_mat, bbox, cv::Scalar(0, 255, 0), 2);
+        cv::putText(image_mat, label, cv::Point(bbox.x, bbox.y), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+    }
+
+	cv::imwrite("output/" + std::to_string(id) + ".jpg", image_mat);
 }
